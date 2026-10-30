@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Offline MP3 Player</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#111827">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<style>
+  :root { --bg:#111827; --card:#1f2937; --text:#f3f4f6; --muted:#9ca3af; --accent:#6366f1; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; margin:0; }
+  body { background:var(--bg); color:var(--text); font:16px/1.4 system-ui,-apple-system,sans-serif;
+         display:flex; flex-direction:column; padding-top:env(safe-area-inset-top); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:14px 16px; }
+  h1 { font-size:20px; margin:0; }
+  .btn { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:10px 16px;
+         font-size:15px; font-weight:600; }
+  .icon { background:none; border:0; color:var(--text); font-size:22px; padding:10px; border-radius:50%; }
+  .icon.on { color:var(--accent); }
+  #list { flex:1; overflow-y:auto; margin:0; padding:0 8px; list-style:none; }
+  #list li { display:flex; align-items:center; gap:8px; padding:12px 10px; border-radius:10px; }
+  #list li.current { background:var(--card); color:#a5b4fc; }
+  #list .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #list .del { background:none; border:0; color:var(--muted); font-size:18px; padding:6px 10px; }
+  .empty { text-align:center; color:var(--muted); padding:48px 24px; }
+  footer { background:var(--card); padding:12px 16px calc(12px + env(safe-area-inset-bottom)); }
+  #title { text-align:center; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-height:1.4em; }
+  .seek { display:flex; align-items:center; gap:10px; font-size:12px; color:var(--muted); margin:8px 0 2px; }
+  .seek input { flex:1; accent-color:var(--accent); }
+  .controls { display:flex; justify-content:center; align-items:center; gap:10px; }
+  .controls .play { font-size:28px; background:var(--accent); width:60px; height:60px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎵 My Music</h1>
+  <button class="btn" id="add">+ Add MP3s</button>
+  <input type="file" id="file" accept="audio/*,.mp3" multiple hidden>
+</header>
+
+<ul id="list"></ul>
+
+<footer>
+  <div id="title">Nothing playing</div>
+  <div class="seek">
+    <span id="cur">0:00</span>
+    <input type="range" id="seek" min="0" max="1000" value="0">
+    <span id="dur">0:00</span>
+  </div>
+  <div class="controls">
+    <button class="icon" id="shuffle" title="Shuffle">🔀</button>
+    <button class="icon" id="prev" title="Previous">⏮</button>
+    <button class="icon play" id="play" title="Play/Pause">▶</button>
+    <button class="icon" id="next" title="Next">⏭</button>
+    <button class="icon" id="repeat" title="Repeat all">🔁</button>
+  </div>
+</footer>
+
+<audio id="audio" preload="metadata"></audio>
+
+<script>
+// ---------- storage (IndexedDB) ----------
+const dbp = new Promise((res, rej) => {
+  const r = indexedDB.open('mp3-player', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('tracks', { keyPath: 'id', autoIncrement: true });
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const tx = async (mode, fn) => {
+  const db = await dbp;
+  return new Promise((res, rej) => {
+    const t = db.transaction('tracks', mode);
+    const req = fn(t.objectStore('tracks'));
+    t.oncomplete = () => res(req && req.result);
+    t.onerror = () => rej(t.error);
+  });
+};
+const getAll = () => tx('readonly', s => s.getAll());
+const put = t => tx('readwrite', s => s.add(t));
+const del = id => tx('readwrite', s => s.delete(id));
+
+// ---------- state ----------
+const $ = id => document.getElementById(id);
+const audio = $('audio');
+let tracks = [], index = -1, shuffle = false, repeat = true, objectUrl = null;
+
+const fmt = s => isFinite(s) ? Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0') : '0:00';
+const clean = n => n.replace(/\.[^.]+$/, '');
+
+// ---------- list ----------
+function render() {
+  const ul = $('list');
+  ul.innerHTML = '';
+  if (!tracks.length) {
+    ul.innerHTML = '<div class="empty">No songs yet.<br>Tap <b>+ Add MP3s</b> to pick files from your phone.</div>';
+    return;
+  }
+  tracks.forEach((t, i) => {
+    const li = document.createElement('li');
+    if (i === index) li.className = 'current';
+    li.innerHTML = '<span class="name"></span><button class="del" aria-label="Delete">✕</button>';
+    li.querySelector('.name').textContent = (i === index ? '▶ ' : '') + clean(t.name);
+    li.querySelector('.name').onclick = () => play(i);
+    li.querySelector('.del').onclick = () => remove(i);
+    ul.appendChild(li);
+  });
+}
+
+async function load() { tracks = (await getAll()).sort((a,b) => a.name.localeCompare(b.name)); render(); }
+
+// ---------- playback ----------
+function play(i) {
+  if (i < 0 || i >= tracks.length) return;
+  index = i;
+  const t = tracks[i];
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = URL.createObjectURL(t.blob);
+  audio.src = objectUrl;
+  audio.play().catch(() => {});
+  $('title').textContent = clean(t.name);
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: clean(t.name), artist: 'My Music' });
+  }
+  render();
+}
+
+function next(auto) {
+  if (!tracks.length) return;
+  let n;
+  if (shuffle && tracks.length > 1) {
+    do { n = Math.floor(Math.random() * tracks.length); } while (n === index);
+  } else {
+    n = index + 1;
+    if (n >= tracks.length) { if (!repeat && auto) return stop(); n = 0; }
+  }
+  play(n);
+}
+const prev = () => {
+  if (audio.currentTime > 3) audio.currentTime = 0;
+  else play(index <= 0 ? tracks.length - 1 : index - 1);
+};
+function stop() { audio.pause(); audio.currentTime = 0; }
+function toggle() { if (index < 0) play(0); else audio.paused ? audio.play() : audio.pause(); }
+
+async function remove(i) {
+  if (!confirm('Delete "' + clean(tracks[i].name) + '"?')) return;
+  await del(tracks[i].id);
+  if (i === index) { audio.pause(); audio.removeAttribute('src'); $('title').textContent = 'Nothing playing'; index = -1; }
+  else if (i < index) index--;
+  const keep = index >= 0 ? tracks[index].id : null;
+  await load();
+  if (keep !== null) index = tracks.findIndex(t => t.id === keep);
+  render();
+}
+
+// ---------- events ----------
+$('add').onclick = () => $('file').click();
+$('file').onchange = async e => {
+  const files = [...e.target.files];
+  const existing = new Set(tracks.map(t => t.name + t.blob.size));
+  for (const f of files) {
+    if (existing.has(f.name + f.size)) continue;
+    await put({ name: f.name, blob: f });
+  }
+  e.target.value = '';
+  const keep = index >= 0 ? tracks[index].id : null;
+  await load();
+  if (keep !== null) index = tracks.findIndex(t => t.id === keep);
+  render();
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+};
+
+$('play').onclick = toggle;
+$('next').onclick = () => next(false);
+$('prev').onclick = prev;
+$('shuffle').onclick = e => { shuffle = !shuffle; e.currentTarget.classList.toggle('on', shuffle); };
+$('repeat').classList.add('on');
+$('repeat').onclick = e => { repeat = !repeat; e.currentTarget.classList.toggle('on', repeat); };
+
+audio.onplay = () => { $('play').textContent = '⏸'; };
+audio.onpause = () => { $('play').textContent = '▶'; };
+audio.onended = () => next(true);
+audio.onloadedmetadata = () => { $('dur').textContent = fmt(audio.duration); };
+let seeking = false;
+audio.ontimeupdate = () => {
+  $('cur').textContent = fmt(audio.currentTime);
+  if (!seeking && audio.duration) $('seek').value = audio.currentTime / audio.duration * 1000;
+};
+$('seek').oninput = () => { seeking = true; };
+$('seek').onchange = e => { audio.currentTime = e.target.value / 1000 * audio.duration; seeking = false; };
+
+if ('mediaSession' in navigator) {
+  const m = navigator.mediaSession;
+  m.setActionHandler('play', () => audio.play());
+  m.setActionHandler('pause', () => audio.pause());
+  m.setActionHandler('nexttrack', () => next(false));
+  m.setActionHandler('previoustrack', prev);
+}
+
+// ---------- boot ----------
+load();
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>
